@@ -24,6 +24,7 @@ from torchtitan.config import CommConfig, Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.rl.actors.utils import (
+    build_policy_gradient_loss,
     compute_policy_gradient_loss,
     compute_token_log_probs,
     verify_logprob_identity,
@@ -139,6 +140,9 @@ class PolicyTrainer(Actor, Configurable):
             optimizers=self.optimizers,
             training_steps=config.training.steps,
         )
+
+        # Build (optionally compiled) loss function
+        self.loss_fn = build_policy_gradient_loss(config.compile)
 
         self.policy_version = 0
         self.generator: Any | None = None
@@ -314,6 +318,7 @@ class PolicyTrainer(Actor, Configurable):
             my_prompt_token_ids,
             my_advantages,
             ref_token_log_probs,
+            loss_fn=self.loss_fn,
             kl_coef=0.1,
         )
 

@@ -4,9 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
+from torchtitan.config import CompileConfig
 from torchtitan.models.common.attention import VarlenMetadata
 
 
@@ -84,12 +88,98 @@ def compute_token_log_probs(
     return token_lps
 
 
+def policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    mask: torch.Tensor,
+    advantages: torch.Tensor,
+    kl_coef: float = 0.1,
+    ppo_clip_eps: float = 0.2,
+    entropy_coef: float = 0.01,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    Compile-friendly GRPO/PPO policy gradient loss on padded tensors.
+
+    Operates on padded, batched log-prob tensors with a boolean mask for
+    valid (non-padding) positions.  Returns scalar tensors — call ``.item()``
+    outside the compiled region to avoid graph breaks.
+
+    Args:
+        policy_log_probs: [batch, max_gen_len] padded policy log probs
+        ref_log_probs: [batch, max_gen_len] padded reference log probs (detached)
+        mask: [batch, max_gen_len] True for valid token positions
+        advantages: [batch] per-sample advantages
+        kl_coef: KL divergence penalty coefficient
+        ppo_clip_eps: PPO clipping epsilon
+        entropy_coef: Entropy bonus coefficient
+
+    Returns:
+        (total_loss, pg_loss, entropy, kl_div, ratio_mean, ratio_clipped_frac)
+    """
+    # Per-token log ratio, zeroed at padding positions
+    token_log_ratio = (policy_log_probs - ref_log_probs) * mask
+
+    # Valid token count per sample (clamp avoids division by zero)
+    token_counts = mask.sum(dim=1).clamp(min=1)  # [batch]
+
+    # Per-sample mean log ratio
+    mean_log_ratio = token_log_ratio.sum(dim=1) / token_counts  # [batch]
+
+    # Per-token KL (Schulman approximation: ratio - 1 - log_ratio)
+    token_ratio = torch.exp(token_log_ratio)
+    token_kl = (token_ratio - 1 - token_log_ratio) * mask
+    mean_kl = token_kl.sum(dim=1) / token_counts  # [batch]
+
+    # PPO clipped objective
+    ratio = torch.exp(mean_log_ratio)
+    unclipped_loss = ratio * advantages
+    clipped_ratio = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps)
+    clipped_loss = clipped_ratio * advantages
+    pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+
+    # Entropy bonus (averaged across all valid tokens)
+    total_valid = mask.sum().clamp(min=1)
+    entropy = -(policy_log_probs * mask).sum() / total_valid
+    entropy_bonus = -entropy_coef * entropy
+
+    # KL divergence penalty (averaged across samples)
+    kl_div = mean_kl.mean()
+
+    # Total loss
+    total_loss = pg_loss + entropy_bonus + kl_coef * kl_div
+
+    # Metric tensors (no .item() — caller converts outside compiled region)
+    ratio_mean = ratio.mean()
+    ratio_clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).float().mean()
+
+    return total_loss, pg_loss, entropy, kl_div, ratio_mean, ratio_clipped_frac
+
+
+def build_policy_gradient_loss(
+    compile_config: CompileConfig,
+) -> Callable[..., tuple[torch.Tensor, ...]]:
+    """Optionally compile ``policy_gradient_loss`` following the build_*_loss pattern."""
+    loss_fn = policy_gradient_loss
+    if compile_config.enable and "loss" in compile_config.components:
+        # if compile_config.enable and "loss" in compile_config.components:
+        loss_fn = torch.compile(loss_fn, backend="inductor", fullgraph=True)
+    return loss_fn
+
+
 def compute_policy_gradient_loss(
     model: torch.nn.Module,
     vllm_token_ids: list[list[int]],
     prompt_token_ids: list[list[int]],
     advantages: torch.Tensor,
     ref_token_log_probs: list[torch.Tensor],
+    loss_fn: Callable[..., tuple[torch.Tensor, ...]] | None = None,
     kl_coef: float = 0.1,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
@@ -106,6 +196,8 @@ def compute_policy_gradient_loss(
         prompt_token_ids: Prompt token IDs for each completion
         advantages: [batch] - Advantages for each sample
         ref_token_log_probs: Per-token log probs from reference model (frozen)
+        loss_fn: Compiled (or eager) loss function from build_policy_gradient_loss.
+            Falls back to uncompiled policy_gradient_loss when None.
         kl_coef: KL divergence penalty coefficient
         ppo_clip_eps: PPO clipping epsilon
         entropy_coef: Entropy bonus coefficient
@@ -130,54 +222,42 @@ def compute_policy_gradient_loss(
         )
         batch_token_log_probs.append(token_lps)
 
-    # Per-token log ratios and KL, averaged across tokens per sample
-    per_sample_mean_log_ratio = []
-    per_sample_mean_kl = []
-    all_token_log_probs = []
+    # Pad variable-length log probs into [batch, max_gen_len] tensors
+    policy_log_probs_padded = pad_sequence(
+        batch_token_log_probs, batch_first=True, padding_value=0.0
+    )
+    ref_log_probs_padded = pad_sequence(
+        [r.detach() for r in ref_token_log_probs],
+        batch_first=True,
+        padding_value=0.0,
+    )
 
-    for policy_token_lps, ref_token_lps in zip(
-        batch_token_log_probs, ref_token_log_probs
-    ):
-        # Per-token log ratio: log(pi/pi_ref) for each token
-        token_log_ratio = policy_token_lps - ref_token_lps.detach()
-        # Average across tokens in this sequence
-        per_sample_mean_log_ratio.append(token_log_ratio.mean())
-        # Per-token KL: E[ratio - 1 - log_ratio] (Schulman approx)
-        token_ratio = torch.exp(token_log_ratio)
-        token_kl = token_ratio - 1 - token_log_ratio
-        per_sample_mean_kl.append(token_kl.mean())
-        all_token_log_probs.append(policy_token_lps)
+    # Build mask: True for valid (non-padding) token positions
+    lengths = torch.tensor([t.shape[0] for t in batch_token_log_probs], device=device)
+    max_len = policy_log_probs_padded.shape[1]
+    mask = torch.arange(max_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
 
-    mean_log_ratio = torch.stack(per_sample_mean_log_ratio)  # [batch]
-    mean_kl = torch.stack(per_sample_mean_kl)  # [batch]
+    # Call (optionally compiled) loss function
+    if loss_fn is None:
+        loss_fn = policy_gradient_loss
 
-    # PPO clipped objective using per-token-averaged ratio
-    ratio = torch.exp(mean_log_ratio)
-    unclipped_loss = ratio * advantages
-    clipped_ratio = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps)
-    clipped_loss = clipped_ratio * advantages
-    pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+    total_loss, pg_loss, entropy, kl_div, ratio_mean, ratio_clipped_frac = loss_fn(
+        policy_log_probs_padded,
+        ref_log_probs_padded,
+        mask,
+        advantages,
+        kl_coef,
+        ppo_clip_eps,
+        entropy_coef,
+    )
 
-    # Entropy bonus (averaged across all tokens)
-    all_token_lps = torch.cat(all_token_log_probs)
-    entropy = -all_token_lps.mean()
-    entropy_bonus = -entropy_coef * entropy
-
-    # KL divergence penalty (averaged across samples)
-    kl_div = mean_kl.mean()
-
-    # Total loss
-    total_loss = pg_loss + entropy_bonus + kl_coef * kl_div
-
+    # Extract metrics outside compiled region
     metrics = {
         "pg_loss": pg_loss.item(),
         "entropy": entropy.item(),
         "kl_div": kl_div.item(),
-        "ratio_mean": ratio.mean().item(),
-        "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
-        .float()
-        .mean()
-        .item(),
+        "ratio_mean": ratio_mean.item(),
+        "ratio_clipped_frac": ratio_clipped_frac.item(),
     }
 
     return total_loss, metrics, batch_token_log_probs
