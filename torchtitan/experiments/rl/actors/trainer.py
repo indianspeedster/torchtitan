@@ -88,13 +88,6 @@ class PolicyTrainer(Actor, Configurable):
         requested = TORCH_DTYPE_MAP[transfer_dtype] if transfer_dtype else None
         self._transfer_dtype = requested if requested != training_dtype else None
 
-        # The policy and ref models share code objects, so dynamo's
-        # per-code-object cache must hold entries for both grad modes
-        # (grad for policy, no_grad for ref). The default limit of 8
-        # is not enough; 16 accommodates both without recompile storms.
-        # TODO: @Lucaskabela fix recompiles in general as these increase startup
-        torch._dynamo.config.cache_size_limit = 16
-
         # Device setup
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
@@ -132,7 +125,11 @@ class PolicyTrainer(Actor, Configurable):
         # Conditionally build frozen reference model for KL penalty
         if kl_coef > 0:
             ref_model = self._build_model(
-                model_spec, config, device_type, hf_assets_path
+                model_spec,
+                config,
+                device_type,
+                hf_assets_path,
+                isolate_code_objects=True,
             )
             ref_model.eval()
             ref_model.requires_grad_(False)
@@ -150,6 +147,11 @@ class PolicyTrainer(Actor, Configurable):
 
         self.policy_version = 0
         self.generator: Any | None = None
+
+        # Constant upper bound for VarlenMetadata max_q/max_k.  Passing this
+        # to compute_token_log_probs prevents dynamo from specializing on
+        # per-episode sequence lengths.
+        self.max_seq_len: int = model.rope.config.max_seq_len
 
         # Data parallelism: determine this rank's shard of the batch.
         self.dp_size = self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
@@ -200,6 +202,7 @@ class PolicyTrainer(Actor, Configurable):
         config: Config,
         device_type: str,
         hf_assets_path: str,
+        isolate_code_objects: bool = False,
     ):
         """Build, parallelize, and initialize a model from checkpoint.
         Will be used to build trainer's policy model and reference model.
@@ -224,6 +227,21 @@ class PolicyTrainer(Actor, Configurable):
         with torch.device("meta"):
             with utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
                 model = model_spec.model.build()
+
+        if isolate_code_objects:
+            # Give each TransformerBlock a distinct forward code object so
+            # dynamo caches this model's compilations independently from
+            # other models of the same class (no cross-model guard conflicts).
+            for block in model.layers.values():  # pyrefly: ignore [not-callable]
+                orig_forward = block.forward.__func__
+
+                def _make_isolated(fn):
+                    def forward(self, *args, **kwargs):
+                        return fn(self, *args, **kwargs)
+
+                    return forward
+
+                block.forward = _make_isolated(orig_forward).__get__(block)
 
         model = model_spec.parallelize_fn(
             model,
@@ -279,17 +297,15 @@ class PolicyTrainer(Actor, Configurable):
         Returns:
             Training metrics
         """
-        # The policy and ref models share code objects, so dynamo's
-        # per-code-object cache must hold entries for both grad modes
-        # (grad for policy, no_grad for ref). The default limit of
-        # is not enough; 16 accommodates both without recompile storms.
-        # TODO: @Lucaskabela fix recompiles in general as these increase startup
-        torch._dynamo.config.recompile_limit = 16
-
         logger.debug(
             f"{os.getpid()=} PolicyTrainer starting step {self.policy_version} "
         )
-
+        # TP collectives cause one expected recompile per code object: layer 0
+        # receives a plain DTensor from embeddings, but layers 1+ receive a
+        # DTensor with AsyncCollectiveTensor from the prior layer's collective.
+        # After step 0 both variants are cached; lock down to catch regressions.
+        if self.policy_version > 0:
+            torch._dynamo.config.recompile_limit = 1
         advantages = torch.tensor([ep.advantage for ep in episodes])
 
         all_token_ids: list[list[int]] = [ep.token_ids for ep in episodes]
@@ -314,7 +330,11 @@ class PolicyTrainer(Actor, Configurable):
             with torch.no_grad():
                 for prompt_toks, gen_toks in zip(my_prompt_token_ids, my_token_ids):
                     ref_lps = compute_token_log_probs(
-                        self.ref_model, prompt_toks, gen_toks, self.device
+                        self.ref_model,
+                        prompt_toks,
+                        gen_toks,
+                        self.device,
+                        max_seq_len=self.max_seq_len,
                     )
                     ref_token_log_probs.append(ref_lps)
 
@@ -325,6 +345,7 @@ class PolicyTrainer(Actor, Configurable):
             my_advantages,
             ref_token_log_probs=ref_token_log_probs,
             kl_coef=self.kl_coef,
+            max_seq_len=self.max_seq_len,
         )
 
         # Verify logprob identity (local shard)

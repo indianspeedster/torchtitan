@@ -12,9 +12,17 @@ from torchtitan.models.common.attention import VarlenMetadata
 # TODO We should either unify all the mask creation for RL, or move them to a
 #      single file.
 def build_varlen_metadata(
-    input_sequences: list[tuple[torch.Tensor, int, int]], device: torch.device
+    input_sequences: list[tuple[torch.Tensor, int, int]],
+    device: torch.device,
+    max_seq_len: int | None = None,
 ) -> VarlenMetadata:
-    """Build VarlenMetadata for all sequences in a batch."""
+    """Build VarlenMetadata for all sequences in a batch.
+
+    Args:
+        max_seq_len: If provided, use this constant as max_q/max_k instead of
+            the actual batch maximum.  A fixed upper bound prevents dynamo from
+            specializing on per-episode sequence lengths (avoids recompiles).
+    """
     cu_seqs = torch.cumsum(
         torch.tensor(
             [0] + [token_ids.shape[0] for token_ids, _, _ in input_sequences],
@@ -25,6 +33,11 @@ def build_varlen_metadata(
         dtype=torch.int32,
     )
     max_len = max(token_ids.shape[0] for token_ids, _, _ in input_sequences)
+    if max_seq_len is not None:
+        assert (
+            max_len <= max_seq_len
+        ), f"Actual max sequence length {max_len} exceeds max_seq_len {max_seq_len}"
+        max_len = max_seq_len
     return VarlenMetadata(
         cu_seq_q=cu_seqs, cu_seq_k=cu_seqs, max_q=max_len, max_k=max_len
     )
@@ -35,6 +48,7 @@ def compute_token_log_probs(
     prompt_ids: list[int],
     gen_ids: list[int],
     device: torch.device,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """
     Compute per-token log probabilities for generated tokens.
@@ -45,6 +59,8 @@ def compute_token_log_probs(
         prompt_ids: Prompt token IDs
         gen_ids: Generated token IDs
         device: Device to run computation on
+        max_seq_len: Constant upper bound for VarlenMetadata max_q/max_k.
+            Prevents dynamo from recompiling on every new sequence length.
 
     Returns:
         Per-token log probabilities for the generated tokens
@@ -52,7 +68,9 @@ def compute_token_log_probs(
     token_ids = torch.tensor(prompt_ids + gen_ids, dtype=torch.long, device=device)
     prompt_len = len(prompt_ids)
     gen_len = len(gen_ids)
-    attention_masks = build_varlen_metadata([(token_ids, prompt_len, gen_len)], device)
+    attention_masks = build_varlen_metadata(
+        [(token_ids, prompt_len, gen_len)], device, max_seq_len=max_seq_len
+    )
 
     full_tensor = token_ids.unsqueeze(0)
 
@@ -92,6 +110,7 @@ def compute_policy_gradient_loss(
     kl_coef: float = 0.0,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
+    max_seq_len: int | None = None,
 ) -> tuple[torch.Tensor, dict, list[torch.Tensor]]:
     """
     Compute GRPO policy gradient loss with entropy bonus.
@@ -112,6 +131,8 @@ def compute_policy_gradient_loss(
         kl_coef: KL divergence penalty coefficient
         ppo_clip_eps: PPO clipping epsilon
         entropy_coef: Entropy bonus coefficient
+        max_seq_len: Constant upper bound for VarlenMetadata max_q/max_k.
+            Prevents dynamo from recompiling on every new sequence length.
 
     Returns:
         loss: Total loss (PG + entropy + optional KL)
@@ -130,6 +151,7 @@ def compute_policy_gradient_loss(
             prompt_toks,
             gen_toks,
             device,
+            max_seq_len=max_seq_len,
         )
         batch_token_log_probs.append(token_lps)
 

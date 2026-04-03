@@ -16,6 +16,7 @@ from typing import ClassVar, NamedTuple
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention import (
@@ -97,6 +98,36 @@ class LocalMapInnerAttention(Module):
         super().__init__()
         self._local_map_fn: Callable | None = None
 
+    def init_local_map(
+        self,
+        placements: tuple,
+        device_mesh: DeviceMesh,
+        return_lse: bool = False,
+    ) -> None:
+        """Eagerly initialize ``_local_map_fn`` so that ``__call__`` never
+        takes the lazy-init branch.  Call this after TP is applied and before
+        ``torch.compile`` so dynamo never sees ``_local_map_fn is None``,
+        eliminating the resulting recompile.
+
+        All entries in *placements* must be ``Shard``; this mirrors the
+        assertion in ``__call__``.  Callers that use ``return_lse=True``
+        (e.g. GPT-OSS attention sinks) must pass it here so that
+        ``out_placements`` has the correct arity.
+        """
+        for p in placements:
+            if not isinstance(p, Shard):
+                raise ValueError(
+                    f"init_local_map requires all Shard placements, got {placements}"
+                )
+        out_placements = (placements, placements) if return_lse else (placements,)
+        self._local_map_fn = local_map(
+            super().__call__,
+            in_placements=(placements, placements, placements),
+            out_placements=out_placements,
+            in_grad_placements=(placements, placements, placements),
+            device_mesh=device_mesh,
+        )
+
     def __call__(
         self,
         q: torch.Tensor,
@@ -130,18 +161,24 @@ class LocalMapInnerAttention(Module):
                 f"All Shard placements must shard on the same dim, "
                 f"but got dims {shard_dims}"
             )
-            # return_lse=True (e.g. gpt_oss attention sinks) produces
-            # 2 outputs instead of 1, requiring different out_placements.
-            return_lse = kwargs.get("return_lse", False)
-            out_placements = (
-                (q.placements, q.placements) if return_lse else (q.placements,)
-            )
             if self._local_map_fn is None:
+                # Fallback lazy init for callers that didn't call
+                # init_local_map (e.g. non-compiled paths).
+                # return_lse=True (e.g. gpt_oss attention sinks) produces
+                # 2 outputs instead of 1, requiring different out_placements.
+                return_lse = kwargs.get("return_lse", False)
+                out_placements = (
+                    (q.placements, q.placements) if return_lse else (q.placements,)
+                )
                 self._local_map_fn = local_map(
                     super().__call__,
                     in_placements=(q.placements, k.placements, v.placements),
                     out_placements=out_placements,
-                    in_grad_placements=(q.placements, k.placements, v.placements),
+                    in_grad_placements=(
+                        q.placements,
+                        k.placements,
+                        v.placements,
+                    ),
                     device_mesh=q.device_mesh,
                 )
             # pyrefly: ignore [bad-argument-count]
