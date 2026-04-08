@@ -657,6 +657,7 @@ class BaseGQAttention(BaseAttention):
             mask_key = "rope" if self.use_rope else "nope"
             attention_masks = attention_masks[mask_key]
 
+        # pyrefly: ignore [not-callable]
         output = self.inner_attention(
             xq,
             xk,
@@ -666,7 +667,7 @@ class BaseGQAttention(BaseAttention):
             enable_gqa=self.enable_gqa,
         ).contiguous()
         output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        return self.wo(output)  # pyrefly: ignore [not-callable]
 
 
 class GQAttention(BaseGQAttention):
