@@ -18,6 +18,31 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 _AC_REGION_ID = "ac_region_id"
+_IS_BWD = "is_bwd"
+_MODULE_FQN = "module_fqn"
+
+
+def _flatten_bucket_fqns(bucket_plans: list[list[str] | str]) -> list[str]:
+    """Flatten a possibly nested bucket plan list into a flat list of FQNs."""
+    result = []
+    for item in bucket_plans:
+        if isinstance(item, list):
+            result.extend(item)
+        else:
+            result.append(item)
+    return result
+
+
+def annotate_module_fqns(model: nn.Module) -> None:
+    """Annotate bucket-level modules' forward with their fully-qualified names.
+
+    Uses get_transformer_block_buckets to determine which modules to annotate,
+    ensuring the annotation granularity matches the bucketing granularity.
+    """
+    fqns = _flatten_bucket_fqns(get_transformer_block_buckets(model))
+    for fqn in fqns:
+        submodule = model.get_submodule(fqn)
+        submodule.forward = annotate_fn({_MODULE_FQN: fqn})(submodule.forward)
 
 
 def annotate_ac_regions(model: nn.Module) -> None:

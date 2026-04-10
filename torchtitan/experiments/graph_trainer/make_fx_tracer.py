@@ -252,8 +252,11 @@ def _copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
     Walks the graph in a single pass. The first node seen for each seq_nr is
     treated as the forward node.
     Subsequent nodes with the same seq_nr (typically backward nodes) receive
-    the forward node's custom metadata.
+    the forward node's custom metadata and are marked with ``is_bwd=True``
+    in their ``custom`` dict.
     """
+    from torchtitan.experiments.graph_trainer.common_utils import _IS_BWD
+
     seq_nr_to_fwd_node: dict[int, torch.fx.Node] = {}
 
     for node in fx_g.graph.nodes:
@@ -268,6 +271,7 @@ def _copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
             custom = fwd_node.meta.get("custom")
             if custom:
                 node.meta.setdefault("custom", {}).update(custom)
+            node.meta.setdefault("custom", {})[_IS_BWD] = True
             nn_module_stack = fwd_node.meta.get("nn_module_stack")
             if nn_module_stack is not None:
                 node.meta["nn_module_stack"] = nn_module_stack.copy()
@@ -416,7 +420,7 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
             traced = make_fx(
                 fn_with_subclass_handling,
                 record_stack_traces=True,
-                record_module_stack=False,  # don't need nn_module_stack for now
+                record_module_stack=True,
             )(*fake_args)
 
         # Copy forward annotations to backward nodes.

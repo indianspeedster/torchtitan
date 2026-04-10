@@ -36,7 +36,11 @@ from torch.fx.passes.regional_inductor import regional_inductor
 from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.distributed.activation_checkpoint import _get_save_ops
-from torchtitan.experiments.graph_trainer.common_utils import _AC_REGION_ID
+from torchtitan.experiments.graph_trainer.common_utils import (
+    _AC_REGION_ID,
+    _IS_BWD,
+    _MODULE_FQN,
+)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.reshard_after_forward import (
     annotate_fsdp_all_gather,
@@ -46,6 +50,7 @@ from torchtitan.tools.logging import logger
 
 def construct_default_graph_passes(
     traced_result: "TracedResult",
+    model: torch.nn.Module,
 ) -> list[Callable]:
     """Build the default pass list for the aot_fx_trace compile path.
 
@@ -55,12 +60,21 @@ def construct_default_graph_passes(
 
     Args:
         traced_result: The traced graph and metadata from ``trace_train_step``.
+        model: The model for extracting transformer block buckets.
 
     Returns:
         An ordered list of graph passes ready to apply.
     """
+    from torchtitan.experiments.graph_trainer.common_utils import (
+        get_transformer_block_buckets,
+    )
+
     passes: list[Callable] = [
         functools.partial(tlparse_log_graph_pass, graph_name="make_fx_graph_traced"),
+        functools.partial(
+            joint_transformer_block_bucketing_reordering_pass,
+            fsdp_manual_buckets=get_transformer_block_buckets(model),
+        ),
     ]
 
     # cudagraph should be the last pass.
@@ -111,18 +125,84 @@ def autobucketing_reordering_pass(
     return gm
 
 
+def _make_module_fqn_stack_fn(
+    *, bwd: bool
+) -> Callable[[torch.fx.Node], list[tuple[str, type]]]:
+    """Create a module_stack_fn that filters nodes by forward/backward direction.
+
+    Args:
+        bwd: If True, only return FQNs for backward nodes. If False, only
+            return FQNs for forward nodes.
+
+    Returns:
+        A callable compatible with make_graph_view's module_stack_fn parameter.
+    """
+
+    def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
+        custom = node.meta.get("custom", {})
+        is_bwd = custom.get(_IS_BWD, False)
+        if is_bwd != bwd:
+            return []
+        fqn = custom.get(_MODULE_FQN)
+        if not fqn:
+            return []
+        return [(fqn, torch.nn.Module)]
+
+    return _stack_fn
+
+
 def transformer_block_bucketing_reordering_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
     *,
     fsdp_manual_buckets,
 ) -> torch.fx.GraphModule:
-    """
-    Apply aten-level manual bucketing and reordering optimization.
+    """Apply aten-level manual bucketing and reordering optimization.
+
+    Used by the AOT and JIT modes where forward and backward graphs are
+    already separate.
     """
     manual_overlap_bucketing(
-        gm, module_bucket_plans=fsdp_manual_buckets, insert_overlap_deps=False
+        gm,
+        module_bucket_plans=fsdp_manual_buckets,
+        insert_overlap_deps=False,
+        module_stack_fn=_make_module_fqn_stack_fn(bwd=False),
     )
+    gm.recompile()
+    return gm
+
+
+def joint_transformer_block_bucketing_reordering_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+    *,
+    fsdp_manual_buckets,
+) -> torch.fx.GraphModule:
+    """Apply manual bucketing and reordering on a joint fwd+bwd graph.
+
+    The joint graph is processed in two passes to ensure each direction's
+    collectives are bucketed independently and reordering uses the correct
+    execution order (forward order for fwd, reversed order for bwd).
+
+    Used by the aot_fx_trace mode where forward and backward are in a
+    single graph.
+    """
+    # Forward pass: bucket and reorder in forward execution order
+    manual_overlap_bucketing(
+        gm,
+        module_bucket_plans=fsdp_manual_buckets,
+        insert_overlap_deps=False,
+        module_stack_fn=_make_module_fqn_stack_fn(bwd=False),
+    )
+
+    # Backward pass: bucket and reorder backward collectives separately
+    manual_overlap_bucketing(
+        gm,
+        module_bucket_plans=fsdp_manual_buckets,
+        insert_overlap_deps=False,
+        module_stack_fn=_make_module_fqn_stack_fn(bwd=True),
+    )
+
     gm.recompile()
     return gm
 
