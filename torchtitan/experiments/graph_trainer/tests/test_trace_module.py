@@ -94,7 +94,10 @@ def _apply_regional_inductor(traced_result):
                 break
 
     context = torch._guards.TracingContext(fake_mode)
-    with torch._guards.tracing(context):
+    with (
+        torch._guards.tracing(context),
+        torch._functorch.config.patch("remat_using_tags_for_fwd_loss_bwd_graph", False),
+    ):
         traced_result.gm = regional_inductor(traced_result.gm)
 
     traced_result.gm.graph.set_codegen(CodeGen())
@@ -491,12 +494,15 @@ class TestMetadataPropagation(unittest.TestCase):
         # Run the copy pass again
         _copy_fwd_metadata_to_bw_nodes(gm)
 
+        def is_backward(node: torch.fx.Node) -> bool:
+            return node.meta.get("custom", {}).get("autograd_backward", False)
+
         # Check that bwd nodes with shared seq_nr got the custom metadata
         for node in gm.graph.nodes:
             if node.op != "call_function" or "seq_nr" not in node.meta:
                 continue
             seq_nr = node.meta["seq_nr"]
-            if node is not seq_nr_first.get(seq_nr):
+            if node is not seq_nr_first.get(seq_nr) and is_backward(node):
                 # This is a backward node
                 custom = node.meta.get("custom")
                 self.assertIsNotNone(
@@ -504,6 +510,21 @@ class TestMetadataPropagation(unittest.TestCase):
                     f"Backward node {node.name} with seq_nr={seq_nr} missing custom metadata",
                 )
                 self.assertEqual(custom.get("test_key"), "test_value")
+
+    def test_copy_fwd_metadata_uses_backward_tagging(self):
+        graph = torch.fx.Graph()
+        fwd = graph.call_function(torch.ops.aten.add.Tensor, args=(1, 2))
+        fwd.meta["seq_nr"] = 7
+        fwd.meta["custom"] = {"test_key": "test_value"}
+        bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(fwd, 3))
+        bwd.meta["seq_nr"] = 7
+        bwd.meta["custom"] = {"autograd_backward": True}
+        graph.output(bwd)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        _copy_fwd_metadata_to_bw_nodes(gm)
+
+        self.assertEqual(bwd.meta["custom"].get("test_key"), "test_value")
 
     def test_backward_nodes_have_stack_trace(self):
         """Verify that backward nodes get stack_trace from their forward counterpart."""
@@ -925,9 +946,9 @@ class GraphBasedSACTestMixin:
             maybe_register_blockmask_pytree_node()
             with maybe_regional:
                 traced = trace_train_step(train_step)(model, *fwd_args, labels)
+            traced.gm = apply_ac_on_fwd_bwd_graph(traced.gm)
             if use_regional_inductor:
                 _apply_regional_inductor(traced)
-            traced.gm = apply_ac_on_fwd_bwd_graph(traced.gm)
 
             def traced_step_fn(model):
                 result = run_traced_train_step(traced, model, *fwd_args, labels)
@@ -1130,7 +1151,6 @@ class TestGraphBasedSAC(GraphBasedSACTestMixin, unittest.TestCase):
             shape=(4, 256),
         )
 
-    @unittest.expectedFailure
     def test_llama4_sac(self):
         from torchtitan.models.common.attention import (
             create_attention_mask,
@@ -1149,7 +1169,6 @@ class TestGraphBasedSAC(GraphBasedSACTestMixin, unittest.TestCase):
             use_regional_inductor=True,
         )
 
-    @unittest.expectedFailure
     def test_gpt_oss_sac(self):
         from torch.nn.attention.flex_attention import and_masks
 
@@ -1432,7 +1451,6 @@ class TestDistributedGraphBasedSAC(FSDPTest):
             tp_degree=2,
         )
 
-    @unittest.expectedFailure
     def test_deepseek_v3_flex_attn_fsdp_graph_sac(self):
         from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import (
             parallelize_deepseekv3,

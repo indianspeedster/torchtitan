@@ -181,24 +181,27 @@ def regional_inductor_pass(
     so that regional_inductor wraps its output in RegionalOutputCode,
     and overrides the ops filter to allow distributed collective ops.
     """
-    if serializable:
-        with torch._functorch.config.patch("force_autograd_cache", True):
-            result = regional_inductor(gm, example_inputs)
-        from torch._inductor.output_code import RegionalOutputCode
+    with torch._functorch.config.patch(
+        "remat_using_tags_for_fwd_loss_bwd_graph", False
+    ):
+        if serializable:
+            with torch._functorch.config.patch("force_autograd_cache", True):
+                result = regional_inductor(gm, example_inputs)
+            from torch._inductor.output_code import RegionalOutputCode
 
-        # Override the ops filter after compilation so that
-        # serialization (which happens later) allows distributed
-        # collective ops like _c10d_functional through GraphPickler.
-        if isinstance(result, RegionalOutputCode):
-            result._ops_filter = _ops_filter_with_distributed
-            result._node_metadata_key_filter = _node_metadata_key_filter_distributed
-        else:
-            logger.warning(
-                "regional_inductor with serializable=True did not produce "
-                "RegionalOutputCode; distributed ops may not serialize correctly."
-            )
-        return result
-    return regional_inductor(gm, example_inputs)
+            # Override the ops filter after compilation so that
+            # serialization (which happens later) allows distributed
+            # collective ops like _c10d_functional through GraphPickler.
+            if isinstance(result, RegionalOutputCode):
+                result._ops_filter = _ops_filter_with_distributed
+                result._node_metadata_key_filter = _node_metadata_key_filter_distributed
+            else:
+                logger.warning(
+                    "regional_inductor with serializable=True did not produce "
+                    "RegionalOutputCode; distributed ops may not serialize correctly."
+                )
+            return result
+        return regional_inductor(gm, example_inputs)
 
 
 def cudagraph_pass(
