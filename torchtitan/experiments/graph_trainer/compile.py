@@ -240,6 +240,7 @@ def apply_compile(
         return model
 
     torch._inductor.config.reorder_for_peak_memory = False
+    torch._inductor.config.triton.cudagraph_kernel_annotations = True
     torch._dynamo.config.capture_scalar_outputs = True
 
     fsdp_reshard_after_forward = get_fsdp_reshard_after_forward_policy(

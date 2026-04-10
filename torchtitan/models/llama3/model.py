@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.fx.traceback import annotate
 
 from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
@@ -48,10 +49,14 @@ class Llama3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        h = x + self.attention(
-            self.attention_norm(x), freqs_cis, attention_masks, positions
-        )
-        out = h + self.feed_forward(self.ffn_norm(h))
+        with annotate({"component": "attention_norm"}):
+            h_norm = self.attention_norm(x)
+        with annotate({"component": "attention"}):
+            h = x + self.attention(h_norm, freqs_cis, attention_masks, positions)
+        with annotate({"component": "ffn_norm"}):
+            h_norm = self.ffn_norm(h)
+        with annotate({"component": "feed_forward"}):
+            out = h + self.feed_forward(h_norm)
         return out
 
 

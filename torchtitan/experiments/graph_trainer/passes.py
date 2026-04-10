@@ -63,6 +63,9 @@ def construct_default_graph_passes(
         functools.partial(tlparse_log_graph_pass, graph_name="make_fx_graph_traced"),
     ]
 
+    # Insert kernel annotation markers before cudagraph capture.
+    passes.append(insert_kernel_annotations_pass)
+
     # cudagraph should be the last pass.
     from torchtitan.experiments.graph_trainer.cudagraph import is_cudagraph_compatible
 
@@ -188,6 +191,74 @@ def regional_inductor_pass(
             )
         return result
     return regional_inductor(gm, example_inputs)
+
+
+def _mark_kernels_enter(annotation: dict) -> object:
+    """Helper called from FX graph to enter a mark_kernels scope."""
+    from torch.cuda._graph_annotations import mark_kernels
+
+    ctx = mark_kernels(annotation)
+    ctx.__enter__()
+    return ctx
+
+
+def _mark_kernels_exit(ctx: object) -> None:
+    """Helper called from FX graph to exit a mark_kernels scope."""
+    ctx.__exit__(None, None, None)  # type: ignore[union-attr]
+
+
+def insert_kernel_annotations_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Insert mark_kernels() calls at component boundaries in the FX graph.
+
+    Reads ``node.meta["custom"]["component"]`` (set via
+    ``torch.fx.traceback.annotate``) and inserts enter/exit calls so that
+    CUDA graph capture records the annotations.
+    """
+    graph = gm.graph
+    current_component: str | None = None
+    current_ctx_node = None
+
+    for node in list(graph.nodes):
+        component = (node.meta.get("custom") or {}).get("component")
+
+        if component != current_component:
+            # Close previous scope
+            if current_ctx_node is not None:
+                with graph.inserting_before(node):
+                    exit_node = graph.call_function(
+                        _mark_kernels_exit, (current_ctx_node,)
+                    )
+                    exit_node.meta["custom"] = {}
+                current_ctx_node = None
+
+            # Open new scope
+            if component is not None:
+                with graph.inserting_before(node):
+                    enter_node = graph.call_function(
+                        _mark_kernels_enter,
+                        ({"component": component},),
+                    )
+                    enter_node.meta["custom"] = {}
+                current_ctx_node = enter_node
+
+            current_component = component
+
+    # Close any trailing scope (before output/return)
+    if current_ctx_node is not None:
+        output_nodes = [n for n in graph.nodes if n.op == "output"]
+        if output_nodes:
+            with graph.inserting_before(output_nodes[0]):
+                exit_node = graph.call_function(
+                    _mark_kernels_exit, (current_ctx_node,)
+                )
+                exit_node.meta["custom"] = {}
+
+    graph.lint()
+    gm.recompile()
+    return gm
 
 
 def cudagraph_pass(
@@ -558,6 +629,7 @@ AVAILABLE_COMPILER_PASSES = {
     "auto_bucketing": autobucketing_reordering_pass,
     "transformer_block_bucketing": transformer_block_bucketing_reordering_pass,
     "regional_inductor": regional_inductor_pass,
+    "insert_kernel_annotations": insert_kernel_annotations_pass,
     "cudagraph": cudagraph_pass,
     "full_inductor_compilation": full_inductor_compilation_pass,
 }

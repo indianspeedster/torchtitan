@@ -6,6 +6,8 @@
 
 import os
 
+from torch.fx.traceback import annotate
+
 # TODO: Re-enable once we have closed
 # https://github.com/pytorch/torchtitan/issues/2722
 os.environ.setdefault("DISABLE_LLVM_OPT", "1")
@@ -635,7 +637,8 @@ class GQAttention(BaseAttention):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        with annotate({"component": "qkv_proj"}):
+            xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them
@@ -652,25 +655,30 @@ class GQAttention(BaseAttention):
 
         # Apply rotary embeddings
         if self.use_rope:
-            if self.rope_backend == "cos_sin":
-                xq, xk = apply_rotary_emb_cos_sin(xq, xk, rope_cache, positions)
-            else:
-                xq, xk = apply_rotary_emb_complex(
-                    xq, xk, freqs_cis=rope_cache, positions=positions
-                )
+            with annotate({"component": "rope"}):
+                if self.rope_backend == "cos_sin":
+                    xq, xk = apply_rotary_emb_cos_sin(
+                        xq, xk, rope_cache, positions
+                    )
+                else:
+                    xq, xk = apply_rotary_emb_complex(
+                        xq, xk, freqs_cis=rope_cache, positions=positions
+                    )
 
         # Handle iRoPE dict masks (Llama4)
         if isinstance(attention_masks, dict):
             mask_key = "rope" if self.use_rope else "nope"
             attention_masks = attention_masks[mask_key]
 
-        output = self.inner_attention(
-            xq,
-            xk,
-            xv,
-            attention_masks=attention_masks,
-            scale=self.scaling,
-            enable_gqa=self.enable_gqa,
-        ).contiguous()
+        with annotate({"component": "sdpa"}):
+            output = self.inner_attention(
+                xq,
+                xk,
+                xv,
+                attention_masks=attention_masks,
+                scale=self.scaling,
+                enable_gqa=self.enable_gqa,
+            ).contiguous()
         output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        with annotate({"component": "o_proj"}):
+            return self.wo(output)

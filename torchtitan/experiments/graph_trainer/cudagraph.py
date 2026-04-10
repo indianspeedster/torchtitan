@@ -31,6 +31,7 @@ class _CUDAGraphManager:
         self._initialized = False
         self._cudagraph_wrappers: list["CUDAGraphWrapper"] = []
         self._teardown_called = False
+        self.all_annotations: dict[int, list] = {}
 
     def maybe_initialize(self) -> None:
         if self._initialized:
@@ -98,6 +99,11 @@ def cudagraph_teardown() -> None:
     See Note [explicit cudagraph teardown] for more details.
     """
     _cg_manager.teardown()
+
+
+def get_cudagraph_annotations() -> dict[int, list]:
+    """Return all kernel annotations accumulated across CUDA graph captures."""
+    return _cg_manager.all_annotations
 
 
 class CUDAGraphWrapper:
@@ -206,9 +212,15 @@ class CUDAGraphWrapper:
                 self._cudagraph,
                 pool=_cg_manager.graph_pool,
                 stream=_cg_manager.stream,
+                enable_annotations=True,
             ):
                 # `output` is managed by pytorch's cudagraph pool
                 self._output = self._runnable(*args)
+
+            # Save kernel annotations for trace post-processing.
+            from torch.cuda._graph_annotations import get_kernel_annotations
+
+            _cg_manager.all_annotations.update(get_kernel_annotations())
 
         if self._should_check_address:
             self._check_static_inputs_address()

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from torch.fx.traceback import annotate
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
@@ -51,4 +52,7 @@ class FeedForward(Module):
         self.w3 = config.w3.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        with annotate({"component": "silu_mul"}):
+            h = F.silu(self.w1(x)) * self.w3(x)
+        with annotate({"component": "down_proj"}):
+            return self.w2(h)
