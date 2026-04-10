@@ -119,7 +119,10 @@ class GraphTrainer(Trainer):
                 )
 
             if self.config.compile.enable_passes:
-                passes = construct_default_graph_passes(self._traced_step)
+                passes = construct_default_graph_passes(
+                    self._traced_step,
+                    pass_names=list(self.config.compile.passes),
+                )
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,
                     self._traced_step.example_inputs,

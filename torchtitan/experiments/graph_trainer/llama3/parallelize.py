@@ -18,6 +18,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_ac_regions,
+    annotate_module_components,
     apply_graph_ac,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
@@ -51,6 +52,7 @@ def annotate_llama(model: GraphTrainerLlama3Model) -> None:
     )
 
     annotate_ac_regions(model)
+    annotate_module_components(model)
 
 
 def parallelize_llama(

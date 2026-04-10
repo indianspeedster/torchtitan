@@ -406,6 +406,132 @@ class TestApplySACPass(TestCase):
             self.assertEqual(node.meta["recompute"], policy, f"node {node.name}")
 
 
+class TestAnnotateModuleComponents(TestCase):
+    """Unit tests for annotate_module_components and insert_kernel_annotations_pass."""
+
+    def _get_components(self, model, example_input):
+        """Trace the model with make_fx and return the set of component annotations."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.traceback import preserve_node_meta
+
+        with preserve_node_meta():
+            gm = make_fx(model)(example_input)
+        components = set()
+        for node in gm.graph.nodes:
+            comp = (node.meta.get("custom") or {}).get("component")
+            if comp:
+                components.add(comp)
+        return components
+
+    def test_annotate_module_components_sets_custom_metadata(self):
+        """annotate_module_components wraps each child module's forward
+        so that traced FX nodes carry component metadata."""
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            annotate_module_components,
+        )
+
+        class Inner(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        class Outer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = Inner()
+                self.b = Inner()
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        model = Outer()
+        annotate_module_components(model)
+        components = self._get_components(model, torch.randn(4))
+
+        self.assertIn("a", components)
+        self.assertIn("b", components)
+
+    def test_annotate_module_components_nested_paths(self):
+        """Nested modules get dot-separated paths."""
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            annotate_module_components,
+        )
+
+        class Child(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class Parent(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.child = Child()
+
+            def forward(self, x):
+                return self.child(x)
+
+        model = Parent()
+        annotate_module_components(model)
+        components = self._get_components(model, torch.randn(4, 4))
+
+        # child.linear is the innermost module, so ops get that annotation.
+        # The parent "child" has no ops of its own outside the linear call.
+        self.assertIn("child.linear", components)
+
+    def test_insert_kernel_annotations_pass_inserts_calls(self):
+        """The pass should insert _mark_kernels_enter/exit calls at
+        component boundaries."""
+        from torchtitan.experiments.graph_trainer.passes import (
+            _mark_kernels_enter,
+            _mark_kernels_exit,
+            insert_kernel_annotations_pass,
+        )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        # Two nodes with component "attn", one with "ffn"
+        n1 = graph.call_function(torch.relu, (x,))
+        n1.meta["custom"] = {"component": "attn"}
+        n2 = graph.call_function(torch.sigmoid, (n1,))
+        n2.meta["custom"] = {"component": "attn"}
+        n3 = graph.call_function(torch.tanh, (n2,))
+        n3.meta["custom"] = {"component": "ffn"}
+        graph.output(n3)
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        insert_kernel_annotations_pass(gm)
+
+        targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertIn(_mark_kernels_enter, targets)
+        self.assertIn(_mark_kernels_exit, targets)
+
+        # Count: 2 scopes (attn, ffn) = 2 enters + 2 exits
+        enters = [t for t in targets if t is _mark_kernels_enter]
+        exits = [t for t in targets if t is _mark_kernels_exit]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(len(exits), 2)
+
+    def test_insert_kernel_annotations_pass_noop_without_metadata(self):
+        """The pass should not insert anything when no custom metadata exists."""
+        from torchtitan.experiments.graph_trainer.passes import (
+            _mark_kernels_enter,
+            insert_kernel_annotations_pass,
+        )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        n1 = graph.call_function(torch.relu, (x,))
+        graph.output(n1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        insert_kernel_annotations_pass(gm)
+
+        targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertNotIn(_mark_kernels_enter, targets)
+
+
 if __name__ == "__main__":
     from torch.testing._internal.common_utils import run_tests
 

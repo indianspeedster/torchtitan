@@ -21,6 +21,22 @@ from torchtitan.tools.logging import logger
 _AC_REGION_ID = "ac_region_id"
 
 
+def annotate_module_components(model: nn.Module, prefix: str = "") -> None:
+    """Annotate every child module's forward with its module path.
+
+    After calling this, every FX node created inside a child module's forward
+    will carry ``node.meta["custom"]["component"] == module_path`` (e.g.
+    ``"layers.0.attention"``).  Works with dynamo, ``make_fx``, and export
+    tracers via ``torch.fx.traceback.annotate_fn``.
+
+    Call once after model construction, before tracing/compilation.
+    """
+    for name, child in model.named_children():
+        path = f"{prefix}.{name}" if prefix else name
+        child.forward = annotate_fn({"component": path})(child.forward)
+        annotate_module_components(child, path)
+
+
 def annotate_ac_regions(model: nn.Module) -> None:
     """Annotate each transformer block with a unique AC region ID.
 

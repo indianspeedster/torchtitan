@@ -519,11 +519,6 @@ def get_compiler_passes_from_config(
                 )
             )
         else:
-            # Auto-insert annotation pass before cudagraph capture.
-            if pass_name == "cudagraph":
-                compiler_passes.append(
-                    AVAILABLE_COMPILER_PASSES["insert_kernel_annotations"]
-                )
             compiler_passes.append(AVAILABLE_COMPILER_PASSES[pass_name])
 
     if pass_names:

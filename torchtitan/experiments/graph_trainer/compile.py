@@ -60,6 +60,29 @@ _SERIALIZABLE_PASSES: frozenset[str] = frozenset(
 )
 
 
+def _maybe_enable_kernel_annotations(compile_config: GraphTrainerCompileConfig) -> None:
+    """Enable inductor kernel annotations if the pass is requested and supported."""
+    if "insert_kernel_annotations" not in compile_config.passes:
+        return
+
+    from torch.cuda._graph_annotations import _is_tools_id_unavailable
+
+    if _is_tools_id_unavailable():
+        logger.warning(
+            "CUDA graph kernel annotations require cuda-python package "
+            "and CUDA toolkit/driver >= 13.1 (or cuda-compat >= 13.1 on "
+            "LD_LIBRARY_PATH). Annotations will be disabled."
+        )
+    elif not hasattr(torch._inductor.config.triton, "cudagraph_kernel_annotations"):
+        logger.warning(
+            "torch._inductor.config.triton.cudagraph_kernel_annotations "
+            "not found. Upgrade to a newer PyTorch version for inductor-"
+            "level kernel annotations."
+        )
+    else:
+        torch._inductor.config.triton.cudagraph_kernel_annotations = True
+
+
 def _apply_jit_compile(
     model: nn.Module,
     compile_config: GraphTrainerCompileConfig,
@@ -240,8 +263,9 @@ def apply_compile(
         return model
 
     torch._inductor.config.reorder_for_peak_memory = False
-    torch._inductor.config.triton.cudagraph_kernel_annotations = True
     torch._dynamo.config.capture_scalar_outputs = True
+
+    _maybe_enable_kernel_annotations(compile_config)
 
     fsdp_reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         parallelism.fsdp_reshard_after_forward, parallel_dims.pp_enabled

@@ -46,6 +46,7 @@ from torchtitan.tools.logging import logger
 
 def construct_default_graph_passes(
     traced_result: "TracedResult",
+    pass_names: list[str] | None = None,
 ) -> list[Callable]:
     """Build the default pass list for the aot_fx_trace compile path.
 
@@ -55,6 +56,7 @@ def construct_default_graph_passes(
 
     Args:
         traced_result: The traced graph and metadata from ``trace_train_step``.
+        pass_names: Pass names from ``compile_config.passes``.
 
     Returns:
         An ordered list of graph passes ready to apply.
@@ -63,8 +65,8 @@ def construct_default_graph_passes(
         functools.partial(tlparse_log_graph_pass, graph_name="make_fx_graph_traced"),
     ]
 
-    # Insert kernel annotation markers before cudagraph capture.
-    passes.append(insert_kernel_annotations_pass)
+    if pass_names and "insert_kernel_annotations" in pass_names:
+        passes.append(insert_kernel_annotations_pass)
 
     # cudagraph should be the last pass.
     from torchtitan.experiments.graph_trainer.cudagraph import is_cudagraph_compatible
@@ -216,7 +218,15 @@ def insert_kernel_annotations_pass(
     Reads ``node.meta["custom"]["component"]`` (set via
     ``torch.fx.traceback.annotate``) and inserts enter/exit calls so that
     CUDA graph capture records the annotations.
+
+    Requires ``cuda-python`` package and CUDA toolkit/driver >= 13.1
+    (or cuda-compat >= 13.1).  Returns the graph unchanged when unavailable.
     """
+    from torch.cuda._graph_annotations import _is_tools_id_unavailable
+
+    if _is_tools_id_unavailable():
+        return gm
+
     graph = gm.graph
     current_component: str | None = None
     current_ctx_node = None
@@ -251,9 +261,7 @@ def insert_kernel_annotations_pass(
         output_nodes = [n for n in graph.nodes if n.op == "output"]
         if output_nodes:
             with graph.inserting_before(output_nodes[0]):
-                exit_node = graph.call_function(
-                    _mark_kernels_exit, (current_ctx_node,)
-                )
+                exit_node = graph.call_function(_mark_kernels_exit, (current_ctx_node,))
                 exit_node.meta["custom"] = {}
 
     graph.lint()
