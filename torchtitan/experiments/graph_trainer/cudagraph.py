@@ -124,11 +124,22 @@ class CUDAGraphWrapper:
         example_inputs: Sequence[Any],
         static_input_indices: tuple[int] | None = None,
         should_check_address: bool = False,
+        *,
+        boxed_call: bool | None = None,
     ):
         _cg_manager.maybe_initialize()
         _cg_manager.register_wrapper(self)
 
         self._runnable = runnable
+        # _boxed_call_inner controls how we *call* the inner runnable
+        # (single list arg vs *args). This is distinct from the outer
+        # _boxed_call attribute that the AOT runtime checks to decide
+        # how to call *us* (see cudagraph_pass in passes.py).
+        self._boxed_call_inner = (
+            boxed_call
+            if boxed_call is not None
+            else getattr(runnable, "_boxed_call", False)
+        )
         self._static_input_indices = OrderedSet(
             static_input_indices if static_input_indices is not None else []
         )
@@ -157,22 +168,31 @@ class CUDAGraphWrapper:
         for i in self._input_indices_to_copy:
             self._args[i].copy_(args[i])
 
-    def _check_input_types(self, inputs) -> None:
+    def _validate_inputs(self, inputs) -> None:
+        """Validate that all inputs are of supported types.
+
+        Opaque inputs (e.g. DeviceMesh from SimpleFSDP/DTensor) are
+        inherently static and already excluded from copying (only
+        tensors appear in ``_input_indices_to_copy``), so no special
+        handling is needed beyond accepting them here.
+        """
         for i, inp in enumerate(inputs):
-            if not (
-                isinstance(inp, (torch.Tensor, int, float, torch._C.Generator))
-                or is_opaque_value(inp)
-            ):
-                raise ValueError(
-                    "args must be tensor, integer (for dynamic shapes), "
-                    "float (for scalar constants), "
-                    "Generator (for random number generator), "
-                    "or opaque object, "
-                    f"but found {type(inp)} with value {inp!r} at index {i}"
-                )
+            if isinstance(inp, (torch.Tensor, int, float, torch._C.Generator)):
+                continue
+            if is_opaque_value(inp):
+                continue
+            raise ValueError(
+                "args must be tensor, integer (for dynamic shapes), "
+                "float (for scalar constants), "
+                "Generator (for random number generator), "
+                "or opaque object, "
+                f"but found {type(inp)} with value {inp!r} at index {i}"
+            )
 
     def _check_static_inputs_address(self) -> None:
         for i in self._static_input_indices:
+            if not isinstance(self._args[i], torch.Tensor):
+                continue
             actual = self._args[i].data_ptr()
             expected = self._input_addresses[i]
             assert expected == actual, (
@@ -180,7 +200,23 @@ class CUDAGraphWrapper:
                 f"{expected} != {actual}"
             )
 
+    def _call_runnable(self, flat_args):
+        if self._boxed_call_inner:
+            return self._runnable(list(flat_args))
+        return self._runnable(*flat_args)
+
     def __call__(self, *args):
+        # Normalize boxed vs unboxed calling convention: internally we
+        # always work with a flat tuple of individual inputs.
+        if (
+            self._boxed_call_inner
+            and len(args) == 1
+            and isinstance(args[0], (list, tuple))
+        ):
+            flat_args = tuple(args[0])
+        else:
+            flat_args = args
+
         if not self._has_warmup:
             self._has_warmup = True
             device = torch.cuda.current_device()
@@ -190,14 +226,14 @@ class CUDAGraphWrapper:
             with _use_cuda_memory_pool_manager(
                 device, _cg_manager.graph_pool, _cg_manager.stream
             ):
-                out = self._runnable(*args)
+                out = self._call_runnable(flat_args)
             return out
 
         if self._cudagraph is None:
-            self._check_input_types(args)
-            self._args = args
+            self._validate_inputs(flat_args)
+            self._args = flat_args
             self._input_addresses = [
-                x.data_ptr() if isinstance(x, torch.Tensor) else None for x in args
+                x.data_ptr() if isinstance(x, torch.Tensor) else None for x in flat_args
             ]
 
             self._cudagraph = torch.cuda.CUDAGraph()
@@ -207,13 +243,12 @@ class CUDAGraphWrapper:
                 pool=_cg_manager.graph_pool,
                 stream=_cg_manager.stream,
             ):
-                # `output` is managed by pytorch's cudagraph pool
-                self._output = self._runnable(*args)
+                self._output = self._call_runnable(flat_args)
 
         if self._should_check_address:
             self._check_static_inputs_address()
 
-        self._copy_non_static_inputs(*args)
+        self._copy_non_static_inputs(*flat_args)
         self._cudagraph.replay()
         return self._output
 

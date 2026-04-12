@@ -21,6 +21,7 @@ Usage:
         --compile.precompile_artifact_dir /tmp/precompile_artifacts
 """
 
+import contextlib
 import dataclasses
 import functools
 
@@ -189,6 +190,33 @@ def main():
         parallelism.fsdp_reshard_after_forward, parallel_dims.pp_enabled
     )
 
+    from .precompile import compute_config_fingerprint
+
+    storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)
+    config_fingerprint = compute_config_fingerprint(
+        model, compile_config, parallel_dims
+    )
+
+    # The custom cudagraph pass (CUDAGraphWrapper) wraps at compile time and
+    # can't be serialized. For precompile, we use Inductor's built-in cudagraph
+    # mechanism instead: setting triton.cudagraphs=True populates
+    # CudagraphCachedInfo in the artifact, and post_compile() applies the
+    # wrapping at load time on each rank.
+    #
+    # This must happen after fingerprint computation (which uses the
+    # original passes list) but before get_compiler_passes_from_config
+    # (which should not include the non-serializable cudagraph pass).
+    use_inductor_cudagraphs = "cudagraph" in compile_config.passes
+    if use_inductor_cudagraphs:
+        compile_config = dataclasses.replace(
+            compile_config,
+            passes=[p for p in compile_config.passes if p != "cudagraph"],
+        )
+        logger.info(
+            "Cudagraph pass replaced with Inductor built-in cudagraphs for "
+            "precompile (CudagraphCachedInfo will be serialized in the artifact)"
+        )
+
     joint_custom_passes = get_joint_custom_passes_from_config(
         parallel_dims, compile_config, fsdp_reshard_after_forward
     )
@@ -199,12 +227,31 @@ def main():
         compiler_passes, dump_folder=config.dump_folder
     )
 
-    from .precompile import compute_config_fingerprint
+    # When cudagraphs are enabled, capture the static input indices for
+    # fwd/bwd while the GraphModule is still inspectable (before Inductor
+    # replaces it with OutputCode). These are stored in the artifact
+    # metadata so that the load-time CUDAGraphPolicy can use them instead
+    # of treating all inputs as dynamic.
+    extra_metadata: dict = {}
+    if use_inductor_cudagraphs:
+        from torchtitan.experiments.graph_trainer.cudagraph import (
+            get_static_input_indices,
+        )
 
-    storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)
-    config_fingerprint = compute_config_fingerprint(
-        model, compile_config, parallel_dims
-    )
+        _orig_fw_compiler = fw_compiler
+        _orig_bw_compiler = bw_compiler
+
+        def fw_compiler(gm, example_inputs):
+            extra_metadata["fw_static_input_indices"] = get_static_input_indices(
+                gm, is_forward=True
+            )
+            return _orig_fw_compiler(gm, example_inputs)
+
+        def bw_compiler(gm, example_inputs):
+            extra_metadata["bw_static_input_indices"] = get_static_input_indices(
+                gm, is_forward=False
+            )
+            return _orig_bw_compiler(gm, example_inputs)
 
     on_compile = _make_precompile_callback(
         model,
@@ -212,6 +259,7 @@ def main():
         parallel_dims,
         storage=storage,
         config_fingerprint=config_fingerprint,
+        extra_metadata=extra_metadata,
     )
 
     model_joint_graph_builder = functools.partial(
@@ -239,8 +287,18 @@ def main():
     dummy_input = torch.randint(
         0, vocab_size, (local_batch_size, seq_len), device=device
     )
+
+    # triton.cudagraphs only needs to be active during compilation
+    # (compile_fx_inner), where it causes Inductor to populate
+    # CudagraphCachedInfo in the serialized artifact. Scope it
+    # tightly to avoid affecting unrelated config readers.
+    cudagraph_ctx: contextlib.AbstractContextManager = contextlib.nullcontext()
+    if use_inductor_cudagraphs:
+        cudagraph_ctx = torch._inductor.config.patch({"triton.cudagraphs": True})
+
     logger.info("Running forward pass to trigger AOT compilation...")
-    compiled_model(dummy_input)
+    with cudagraph_ctx:
+        compiled_model(dummy_input)
 
     logger.info(
         f"Precompile complete. Artifact saved to "

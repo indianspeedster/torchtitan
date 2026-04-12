@@ -86,6 +86,7 @@ def _make_precompile_callback(
     parallel_dims: ParallelDims,
     storage: StorageAdapter | None = None,
     config_fingerprint: ConfigFingerprint | None = None,
+    extra_metadata: dict | None = None,
 ):
     """Build the on_compile callback that saves the compiled artifact to disk."""
     from .precompile import compute_config_fingerprint, precompile_save
@@ -98,14 +99,17 @@ def _make_precompile_callback(
         )
 
     def on_compile(compiled_fn, out_spec):
+        metadata: dict = {
+            "world_size": torch.distributed.get_world_size(),
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         precompile_save(
             model,
             compiled_fn,
             storage,
             out_spec=out_spec,
-            metadata={
-                "world_size": torch.distributed.get_world_size(),
-            },
+            metadata=metadata,
             config_fingerprint=config_fingerprint,
         )
 
@@ -140,8 +144,15 @@ def _apply_aot_compile(
                 f"Run precompile_main first to generate the artifact."
             )
 
+        cudagraph_enabled = "cudagraph" in compile_config.passes
+        is_regional = "regional_inductor" in compile_config.passes
         return _apply_aot_compile_load(
-            model, parallel_dims, storage, config_fingerprint
+            model,
+            parallel_dims,
+            storage,
+            config_fingerprint,
+            cudagraph=cudagraph_enabled,
+            is_regional=is_regional,
         )
 
     # Get joint custom passes from config
@@ -183,6 +194,8 @@ def _apply_aot_compile_load(
     parallel_dims: ParallelDims,
     storage: StorageAdapter,
     config_fingerprint: ConfigFingerprint,
+    cudagraph: bool = False,
+    is_regional: bool = False,
 ) -> CompiledModule:
     """Load a precompiled artifact and wrap the model with it."""
     from .precompile import precompile_load
@@ -195,6 +208,8 @@ def _apply_aot_compile_load(
         model,
         storage,
         expected_fingerprint=config_fingerprint,
+        cudagraph=cudagraph,
+        is_regional=is_regional,
     )
 
     def _unused_graph_builder(*args, **kwargs):
