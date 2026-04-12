@@ -27,6 +27,7 @@ import functools
 import torch
 import torch.distributed as dist
 
+from torchtitan.components.forward_utils import build_forward_extra_kwargs
 from torchtitan.config import ConfigManager, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -49,6 +50,16 @@ from torchtitan.experiments.graph_trainer.precompile import _ARTIFACT_KEY
 from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
+
+
+class _DummyTokenizer:
+    """Minimal tokenizer stand-in for precompile.
+
+    Only eos_id is needed by get_attention_masks() to compute document
+    boundaries. Values don't matter — only pytree structure must match.
+    """
+
+    eos_id = 0
 
 
 def main():
@@ -255,8 +266,20 @@ def main():
     dummy_input = torch.randint(
         0, vocab_size, (local_batch_size, seq_len), device=device
     )
+
+    # Build extra kwargs (positions, attention_masks) using the same
+    # shared function as the training path.
+
+    extra_kwargs = build_forward_extra_kwargs(
+        model_config,
+        model,
+        dummy_input,
+        tokenizer=_DummyTokenizer(),
+        parallel_dims=parallel_dims,
+    )
+
     logger.info("Running forward pass to trigger AOT compilation...")
-    compiled_model(dummy_input)
+    compiled_model(dummy_input, **extra_kwargs)
 
     logger.info(
         f"Precompile complete. Artifact saved to "
