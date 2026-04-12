@@ -37,12 +37,10 @@ from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.compile import apply_compile_sparse
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.expert_parallel import (
-    DeepEPExpertParallel,
     ExpertParallel,
+    ExpertSequenceParallel,
     ExpertTensorParallel,
-    ReordererSequenceParallel,
     TensorParallel,
-    TorchAOExpertParallel,
 )
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import (
@@ -139,7 +137,6 @@ def parallelize_llama(
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             comm_backend=comm_backend,
-            hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
             pad_multiple=pad_multiple,
         )
 
@@ -523,7 +520,6 @@ def apply_moe_ep_tp(
     etp_mesh: DeviceMesh | None,
     ep_etp_mesh: DeviceMesh | None,
     comm_backend: str = "standard",
-    hybridep_non_blocking_expert_capacity_factor: float | None = None,
     pad_multiple: int | None = None,
 ):
     assert ep_mesh is not None or tp_mesh is not None
@@ -551,12 +547,6 @@ def apply_moe_ep_tp(
                     local_output_grad_placements=(Partial(),),
                 ),
             }
-            if ep_mesh is not None and etp_mesh is None:
-                # If TP is borrowed for EP, then split the tokens across TP ranks so that
-                # the reorderer, the all-to-all comms, and routed experts computation
-                # are effectively running Sequence Parallel (split along the folded bs*slen dim)
-                # pyrefly: ignore [no-matching-overload]
-                moe_layer_plan.update({"moe.reorderer": ReordererSequenceParallel()})
             # pyrefly: ignore [missing-attribute]
             if transformer_block.moe.shared_experts is not None:
                 # Use ColwiseParallelWithGradPlacement to keep d_x as Partial in
@@ -602,20 +592,14 @@ def apply_moe_ep_tp(
                         "DeepEP does not support pad_multiple. "
                         "Use hybridep or standard comm backend instead."
                     )
-                # pyrefly: ignore [missing-attribute]
-                score_before_experts = transformer_block.moe.score_before_experts
-
-                experts_plan = DeepEPExpertParallel(
-                    score_before_experts=score_before_experts,
-                    comm_backend=comm_backend,
-                    hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
-                    pad_multiple=pad_multiple,
-                )
-                logger.info(f"Applying {comm_backend.upper()} to MoE layer")
-            elif pad_multiple is not None:
-                experts_plan = TorchAOExpertParallel(pad_multiple)
+                    logger.info(f"Applying {comm_backend.upper()} to MoE layer")
+            if tp_mesh is not None:
+                # ETP=1: EP borrows from TP. Each EP rank processes a
+                # disjoint token subset (sequence parallel).
+                experts_plan = ExpertSequenceParallel()
             else:
-                # input / output sharding on the batch / tokens dim
+                # Weight sharding only — dispatch/combine handled by
+                # the token dispatcher.
                 experts_plan = ExpertParallel()
         else:
             if pad_multiple is not None:

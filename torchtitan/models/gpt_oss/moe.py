@@ -149,11 +149,14 @@ class GptOssGroupedExperts(Module):
         )  # (num_experts, out_dim, in_dim)
         self.mlp2_bias = nn.Parameter(torch.empty((num_experts, dim)))
 
-    def forward(
+        self.token_dispatcher = config.token_dispatcher.build()
+
+    def _experts_forward(
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
+        """Raw expert computation without dispatch/combine."""
         if isinstance(self.mlp1_weight, DTensor):
             # Convert parameters from DTensors to plain Tensors, to work with
             # dynamic-shape inputs in EP which cannot be easily expressed as DTensors.
@@ -203,6 +206,22 @@ class GptOssGroupedExperts(Module):
                 tp_degree,
             )
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        top_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        *,
+        outputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch tokens to experts, compute, and combine results."""
+        routed_input, num_tokens_local, metadata = self.token_dispatcher.dispatch(
+            x, top_scores, selected_experts_indices, num_tokens_per_expert
+        )
+        routed_output = self._experts_forward(routed_input, num_tokens_local)
+        return self.token_dispatcher.combine(routed_output, metadata, outputs=outputs)
+
 
 class GptOssMoE(MoE):
     """GptOss MoE implementation that inherits from the base MoE class."""
@@ -223,6 +242,7 @@ class GptOssMoE(MoE):
             swiglu_limit=config.swiglu_limit,
             use_grouped_mm=config.experts.use_grouped_mm,
             param_init=config.experts.param_init,
+            token_dispatcher=config.experts.token_dispatcher,
         )
         # pyrefly: ignore [bad-assignment]
         self.experts = gptoss_experts_config.build()

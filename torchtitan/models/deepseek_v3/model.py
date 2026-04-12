@@ -223,6 +223,7 @@ class DeepSeekV3Model(Decoder):
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
                     )
+
                     if parallelism.expert_parallel_comm_backend in (
                         "deepep",
                         "hybridep",

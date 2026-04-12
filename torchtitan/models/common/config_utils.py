@@ -18,6 +18,13 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts, MoE, TokenChoiceTopKRouter
 from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.common.token_dispatcher import (
+    BaseTokenDispatcher,
+    DeepEPTokenDispatcher,
+    LocalTokenDispatcher,
+    TokenDispatcher,
+    TorchAOTokenDispatcher,
+)
 
 
 def make_gqa_config(
@@ -133,13 +140,98 @@ def make_router_config(
     )
 
 
+def make_token_dispatcher_config(
+    *,
+    num_experts: int,
+    top_k: int,
+    score_before_experts: bool = True,
+    comm_backend: str = "standard",
+    ep_degree: int = 1,
+    hybridep_non_blocking_expert_capacity_factor: float | None = None,
+    pad_multiple: int | None = None,
+) -> BaseTokenDispatcher.Config:
+    """Build the appropriate token dispatcher config.
+
+    Returns the right Config subclass based on parallelism settings:
+    - EP=1 (default): LocalTokenDispatcher.Config → LocalTokenDispatcher
+    - EP>1, standard: TokenDispatcher.Config → TokenDispatcher
+    - EP>1, standard, pad_multiple: TorchAOTokenDispatcher.Config → TorchAOTokenDispatcher
+    - EP>1, deepep/hybridep: DeepEPTokenDispatcher.Config → DeepEPTokenDispatcher
+      (pad_multiple is handled internally by the DeepEP/HybridEP library)
+    """
+    if ep_degree > 1 and comm_backend in ("deepep", "hybridep"):
+        return DeepEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            score_before_experts=score_before_experts,
+            ep_degree=ep_degree,
+            comm_backend=comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
+            pad_multiple=pad_multiple,
+        )
+    elif ep_degree > 1 and pad_multiple is not None:
+        return TorchAOTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            score_before_experts=score_before_experts,
+            ep_degree=ep_degree,
+            pad_multiple=pad_multiple,
+        )
+    elif ep_degree > 1:
+        return TokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            score_before_experts=score_before_experts,
+            ep_degree=ep_degree,
+        )
+    else:
+        return LocalTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            score_before_experts=score_before_experts,
+        )
+
+
+def apply_ep(
+    layers: list,
+    *,
+    ep_degree: int,
+    comm_backend: str = "standard",
+    hybridep_non_blocking_expert_capacity_factor: float | None = None,
+    pad_multiple: int | None = None,
+) -> None:
+    """Replace token dispatchers in MoE layers for expert parallelism.
+
+    Mutates layer configs in-place: for each MoE layer, replaces the
+    token_dispatcher with the appropriate config based on EP settings.
+    """
+    for layer_cfg in layers:
+        if layer_cfg.moe is not None:
+            td = layer_cfg.moe.experts.token_dispatcher
+            layer_cfg.moe.experts.token_dispatcher = make_token_dispatcher_config(
+                num_experts=td.num_experts,
+                top_k=td.top_k,
+                score_before_experts=td.score_before_experts,
+                ep_degree=ep_degree,
+                comm_backend=comm_backend,
+                hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
+                pad_multiple=pad_multiple,
+            )
+
+
 def make_experts_config(
     *,
     dim: int,
     hidden_dim: int,
     num_experts: int,
+    top_k: int,
     param_init: dict[str, Callable],
+    score_before_experts: bool = True,
     use_grouped_mm: bool = True,
+    ep_degree: int = 1,
+    comm_backend: str = "standard",
+    hybridep_non_blocking_expert_capacity_factor: float | None = None,
+    pad_multiple: int | None = None,
 ) -> GroupedExperts.Config:
     """Build a fully-specified GroupedExperts.Config."""
     return GroupedExperts.Config(
@@ -148,4 +240,13 @@ def make_experts_config(
         num_experts=num_experts,
         use_grouped_mm=use_grouped_mm,
         param_init=param_init,
+        token_dispatcher=make_token_dispatcher_config(
+            num_experts=num_experts,
+            top_k=top_k,
+            score_before_experts=score_before_experts,
+            ep_degree=ep_degree,
+            comm_backend=comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
+            pad_multiple=pad_multiple,
+        ),
     )

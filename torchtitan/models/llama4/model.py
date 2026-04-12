@@ -149,6 +149,7 @@ class Llama4Model(Decoder):
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
                     )
+
                     if parallelism.expert_parallel_comm_backend == "deepep":
                         from torchtitan.models.common.moe_deepep import DeepEPMoE
 

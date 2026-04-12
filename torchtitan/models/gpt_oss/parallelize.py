@@ -32,8 +32,7 @@ from torchtitan.distributed.compile import apply_compile_sparse
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.expert_parallel import (
     ExpertParallel,
-    ReordererSequenceParallel,
-    TorchAOExpertParallel,
+    ExpertSequenceParallel,
 )
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.models.gpt_oss.model import GptOssModel
@@ -289,13 +288,6 @@ def apply_moe_ep_tp(
                     local_output_grad_placements=(Partial(),),
                 ),
             }
-            if ep_mesh is not None and not etp_enabled:
-                # If TP is borrowed for EP, then split the tokens across TP ranks so that
-                # the reorderer, the all-to-all comms, and routed experts computation
-                # are effectively running Sequence Parallel (split along the folded bs*slen dim)
-                # pyrefly: ignore [no-matching-overload]
-                moe_layer_plan.update({"moe.reorderer": ReordererSequenceParallel()})
-
             parallelize_module(
                 # pyrefly: ignore [bad-argument-type]
                 module=transformer_block,
@@ -311,10 +303,13 @@ def apply_moe_ep_tp(
             experts_plan = GptossTensorParallel()
         elif tp_mesh is None or not etp_enabled:
             experts_mesh = ep_mesh
-            if pad_multiple is not None:
-                experts_plan = TorchAOExpertParallel(pad_multiple)
+            if tp_mesh is not None:
+                # ETP=1: EP borrows from TP. Each EP rank processes a
+                # disjoint token subset (sequence parallel).
+                experts_plan = ExpertSequenceParallel()
             else:
-                # input / output sharding on the batch / tokens dim
+                # Weight sharding only — dispatch/combine handled by
+                # the token dispatcher.
                 experts_plan = ExpertParallel()
         else:
             if pad_multiple is not None:
