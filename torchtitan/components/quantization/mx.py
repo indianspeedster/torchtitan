@@ -13,7 +13,7 @@ from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.distributed import ParallelDims
 from torchtitan.models.common.linear import Linear
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.utils import has_cuda_capability, has_rocm_capability
 
 from .module_utils import (
     capture_module_attrs,
@@ -33,11 +33,12 @@ class MXFP8Converter(QuantizationConverter):
     class Config(QuantizationConverter.Config):
         _quantization_type: ClassVar[str] = "mxfp8"
 
-        recipe_name: Literal["mxfp8_rceil"] = "mxfp8_rceil"
+        recipe_name: Literal["mxfp8_rceil", "mxfp8_rceil_wgrad_with_hp"] = "mxfp8_rceil"
         """
-        Quantization recipe name for grouped GEMMs. Options: ["mxfp8_rceil"]
+        Quantization recipe name for grouped GEMMs. Options: ["mxfp8_rceil", "mxfp8_rceil_wgrad_with_hp"]
 
-        - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode when computing the e8m0 scale factors.
+        - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode.
+        - mxfp8_rceil_wgrad_with_hp: Same as mxfp8_rceil but uses high-precision (bf16) for weight gradients.
         """
 
         fqns: list[str] = field(default_factory=list)
@@ -46,6 +47,15 @@ class MXFP8Converter(QuantizationConverter):
         Comma-separated list of fully qualified names of MoE modules to apply MXFP8 dynamic quantization
         on grouped GEMM operations.
         This is a prototype feature that requires the torchao nightly build.
+        """
+
+        pad_token_groups_for_grouped_mm: bool = True
+        """
+        Boolean indicating if token group sizes should be padded to multiple of 32 (MXFP8 scaling block size)
+        for compatibility with quantization kernels. Default is true.
+
+        If using HybridEP, set to false. HybridEP automatically performs this padding as part of the
+        all-to-all dispatch step, so running the padding/unpadding kernels would incur unnecessary extra overhead.
         """
 
     def __init__(
@@ -63,20 +73,14 @@ class MXFP8Converter(QuantizationConverter):
                 "torchao is not installed. Please install it to use MXFP8 linear layers."
             )
 
-        # Can be removed if we enable the emulated versions
-        assert has_cuda_capability(
-            10, 0
-        ), "MXFP8 is only supported on SM100 or architectures"
+        assert has_cuda_capability(10, 0) or has_rocm_capability(
+            9, 5
+        ), "MXFP8 is only supported on CUDA SM100 or later, or ROCm gfx950 or later"
 
         if not model_compile_enabled:
             logger.warning(
                 "torch.compile enablement is required for highest performance of MXFP8 dynamic quantization."
             )
-
-        # If EP is enabled, TorchTitan handles the token group padding for MXFP8 grouped GEMM
-        # as part of the EP implementation (except for DeepEP backend).
-        # Otherwise, if EP is not enabled, we need TorchAO to pad the token groups.
-        self.pad_token_groups_for_grouped_mm = not parallel_dims.ep_enabled
 
         self.config = config
         self.enabled = True
@@ -113,7 +117,7 @@ class MXFP8Converter(QuantizationConverter):
         recipe = MXFP8TrainingRecipe(self.config.recipe_name)
         mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
         mxfp8_op_config.pad_token_groups_for_grouped_mm = (
-            self.pad_token_groups_for_grouped_mm
+            self.config.pad_token_groups_for_grouped_mm
         )
 
         quantize_(model, config=mxfp8_op_config, filter_fn=module_filter_fn)
