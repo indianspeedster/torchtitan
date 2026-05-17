@@ -5,17 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
+    MXFP8GroupedExpertsConverter,
 )
 from torchtitan.config import (
     ActivationCheckpointConfig,
     CompileConfig,
+    DebugConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -76,33 +78,51 @@ def deepseek_v3_debugmodel_flex_attn_ep() -> Trainer.Config:
 
 
 def deepseek_v3_16b() -> Trainer.Config:
+    # Matched to the container's rocm/pytorch-private:mxfp8-gfx950-v26.6 config so
+    # local vs container runs can be compared apples-to-apples on the same MXFP8
+    # workload (LBS=1, full AC, force-balanced experts, MXFP8 on the experts).
+    compile_config = CompileConfig(enable=True, components=["loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
     return Trainer.Config(
-        loss=ChunkedCELoss.Config(),
+        # Upstream uses ChunkedCELoss + compile=loss, but on this torch
+        # 2.13.0.dev nightly the chunked path traces into flex_attention's
+        # higher-order op and the autograd engine errors with "data is not
+        # allocated yet" / "(Proxy,)" type mismatch in validate_subgraph_args_types.
+        # Plain CrossEntropyLoss works. Bug surfaces without MXFP8 too.
+        loss=CrossEntropyLoss.Config(),
         hf_assets_path="./assets/hf/deepseek-moe-16b-base",
-        model_spec=model_registry("16B", attn_backend="flex"),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        model_spec=model_registry(
+            "16B",
+            attn_backend="flex",
+            converters=[
+                MXFP8GroupedExpertsConverter.Config(
+                    recipe_name="mxfp8_rceil",
+                    model_compile_enabled=model_compile_enabled,
+                ),
+            ],
         ),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=OptimizersContainer.Config(lr=2.2e-4),
         lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=20,
             decay_ratio=0.8,
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
         training=TrainingConfig(
-            local_batch_size=4,
+            local_batch_size=1,
             seq_len=4096,
-            steps=1000,
+            steps=50,
         ),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="Interleaved1F1B",
             expert_parallel_degree=8,
         ),
         checkpoint=CheckpointManager.Config(interval=10),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
-        compile=CompileConfig(enable=True, components=["loss"]),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        compile=compile_config,
     )
 
 

@@ -12,7 +12,7 @@ from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.utils import has_cuda_capability, has_rocm_capability
 
 from .utils import swap_token_dispatcher
 
@@ -164,9 +164,9 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
                 "torchao is not installed. Please install it to use MXFP8 MoE training."
             )
 
-        assert has_cuda_capability(
-            10, 0
-        ), "MXFP8 is only supported on SM100 or later architectures"
+        assert has_cuda_capability(10, 0) or has_rocm_capability(9, 5), (
+            "MXFP8 is only supported on CUDA SM100 or later, or ROCm gfx950 or later"
+        )
 
         if not self.config.model_compile_enabled:
             logger.warning(
