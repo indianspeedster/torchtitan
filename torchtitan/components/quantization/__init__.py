@@ -38,6 +38,7 @@ from .float8 import (  # noqa: F401, E402
     Float8LinearConverter,
 )
 from .mx import (  # noqa: F401, E402
+    MXFP4GroupedExpertsConverter,
     MXFP8GroupedExpertsConverter,
     MXFP8Linear,
     MXFP8LinearConverter,
@@ -47,6 +48,7 @@ __all__ = [
     "Float8GroupedExpertsConverter",
     "Float8Linear",
     "Float8LinearConverter",
+    "MXFP4GroupedExpertsConverter",
     "MXFP8GroupedExpertsConverter",
     "MXFP8Linear",
     "MXFP8LinearConverter",
