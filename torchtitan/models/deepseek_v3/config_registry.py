@@ -12,6 +12,7 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
+    MXFP4GroupedExpertsConverter,
 )
 from torchtitan.config import (
     ActivationCheckpointConfig,
@@ -63,6 +64,21 @@ def deepseek_v3_debugmodel_ep() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_debugmodel_mxfp4() -> Trainer.Config:
+    """DeepSeek-V3 debug model with MXFP4 MoE grouped-GEMM training (ROCm gfx950)."""
+    config = deepseek_v3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP4GroupedExpertsConverter.Config(
+                recipe_name="mxfp4_rceil",
+                pad_token_groups_for_grouped_mm=True,
+            ),
+        ],
+    )
+    return config
+
+
 def deepseek_v3_debugmodel_flex_attn() -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     config.model_spec = model_registry("debugmodel", attn_backend="flex")
@@ -104,6 +120,27 @@ def deepseek_v3_16b() -> Trainer.Config:
         ),
         compile=CompileConfig(enable=True, components=["loss"]),
     )
+
+
+def deepseek_v3_16b_mxfp4() -> Trainer.Config:
+    """DeepSeek-V3 16B with MXFP4 MoE grouped-GEMM training (ROCm gfx950).
+
+    Mirrors deepseek_v3_16b but routes the expert grouped GEMMs through the
+    MXFP4 (e2m1 data + E8M0 block scales) training path. MXFP4 requires expert
+    parallelism (EP>1); the 16B config already uses expert_parallel_degree=8.
+    """
+    config = deepseek_v3_16b()
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        converters=[
+            MXFP4GroupedExpertsConverter.Config(
+                recipe_name="mxfp4_rceil",
+                pad_token_groups_for_grouped_mm=True,
+            ),
+        ],
+    )
+    return config
 
 
 def deepseek_v3_671b() -> Trainer.Config:
