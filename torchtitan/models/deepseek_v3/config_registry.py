@@ -65,13 +65,33 @@ def deepseek_v3_debugmodel_ep() -> Trainer.Config:
 
 
 def deepseek_v3_debugmodel_mxfp4() -> Trainer.Config:
-    """DeepSeek-V3 debug model with MXFP4 MoE grouped-GEMM training (ROCm gfx950)."""
+    """DeepSeek-V3 debug model with MXFP4 MoE grouped-GEMM training (ROCm gfx950).
+
+    Single-device (no EP/HybridEP), so token groups are padded to the MXFP4
+    scaling block (32).
+    """
     config = deepseek_v3_debugmodel()
     config.model_spec = model_registry(
         "debugmodel",
         converters=[
             MXFP4GroupedExpertsConverter.Config(
                 recipe_name="mxfp4_rceil",
+                pad_token_groups_for_grouped_mm=True,
+            ),
+        ],
+    )
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp4_hp() -> Trainer.Config:
+    # MXFP4 fwd/dgrad with bf16 (high-precision) weight gradient. Used to
+    # localize NaNs: bypasses the MXFP4 wgrad quant path entirely.
+    config = deepseek_v3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP4GroupedExpertsConverter.Config(
+                recipe_name="mxfp4_rceil_wgrad_with_hp",
                 pad_token_groups_for_grouped_mm=True,
             ),
         ],
@@ -140,6 +160,48 @@ def deepseek_v3_16b_mxfp4() -> Trainer.Config:
             ),
         ],
     )
+    return config
+
+
+def deepseek_v3_16b_bench_bf16() -> Trainer.Config:
+    # 16B perf benchmark (bf16 baseline), EP=8, eager. Uses the test tokenizer +
+    # c4_test so no asset/dataset download is needed; token content is irrelevant
+    # for throughput (TPS depends on model shapes, not the data).
+    config = deepseek_v3_16b()
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    config.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_test")
+    config.model_spec = model_registry("16B")
+    config.compile = CompileConfig(enable=False)
+    config.training = TrainingConfig(local_batch_size=4, seq_len=4096, steps=30)
+    config.parallelism = ParallelismConfig(expert_parallel_degree=8)
+    config.checkpoint = CheckpointManager.Config(interval=1000)
+    return config
+
+
+def deepseek_v3_16b_bench_mxfp4() -> Trainer.Config:
+    # Same as the bf16 bench, with MXFP4 MoE quantization (ROCm gfx950).
+    config = deepseek_v3_16b_bench_bf16()
+    config.model_spec = model_registry(
+        "16B",
+        converters=[
+            MXFP4GroupedExpertsConverter.Config(
+                recipe_name="mxfp4_rceil",
+                pad_token_groups_for_grouped_mm=True,
+            ),
+        ],
+    )
+    return config
+
+
+def deepseek_v3_16b_bench_bf16_compile() -> Trainer.Config:
+    config = deepseek_v3_16b_bench_bf16()
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    return config
+
+
+def deepseek_v3_16b_bench_mxfp4_compile() -> Trainer.Config:
+    config = deepseek_v3_16b_bench_mxfp4()
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
     return config
 
 
